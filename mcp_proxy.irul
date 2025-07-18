@@ -1,0 +1,124 @@
+when RULE_INIT {
+    set static::debug_mcp_virtual 1
+}
+when HTTP_REQUEST priority 500 {
+    set uri [HTTP::uri]
+    if { $static::debug_mcp_virtual} { log local0.info "MCP Request: [HTTP::method] $uri from [IP::client_addr]" }
+
+    if { [HTTP::header exists "Upgrade"] && [string tolower [HTTP::header "Upgrade"]] eq "websocket" } {
+        if { $static::debug_mcp_virtual} { log local0.info "WebSocket upgrade request detected" }
+        ONECONNECT::detach disable
+    } elseif { $uri starts_with "/sse" || ($uri starts_with "/message" && [HTTP::method] == "POST") } {
+        if { $static::debug_mcp_virtual} { log local0.info "SSE request detected" }
+        HTTP::collect 100000
+    }
+}
+when HTTP_REQUEST_DATA priority 500 {
+    set json_data [HTTP::payload]
+    if { $static::debug_mcp_virtual} { log local0.info "Request payload: $json_data" }
+
+    if { [catch {
+        set request [call JSON::parse_request $json_data]
+        set method [call JSON::get_method $request]
+        set params [call JSON::get_params $request]
+        set id [call JSON::get_id $request]
+
+        if { $static::debug_mcp_virtual } { log local0.info "Request: $request; ID: $id" }
+
+        switch -- $method {
+            "tools/call" {
+                set tool_name [call JSON::get_tool_name $params]
+                if { $tool_name == "run_command" } {
+                    if { $static::debug_mcp_virtual } { log local0.info "VIOLATION: MCP tool $tool_name not allowed." }
+                    HTTP::respond 403 content [call JSON::create_error $id -32605 "VIOLATION: MCP tool $tool_name not allowed."]
+                }
+                set response [call JSON::create_response $id $params]
+            }
+            "tools/list" { }
+            default {
+                set response [call JSON::create_error $id -32601 "Method not found"]
+            }
+        }
+
+        if { ![call JSON::is_notification $request] } {
+            if { $static::debug_mcp_virtual } { log local0.info [call JSON::encode_dict $response] }
+        }
+
+    } error_msg] } {
+
+        if { $static::debug_mcp_virtual } { log local0.info [call JSON::encode_dict [call JSON::create_error "" -32700 "Parse error"]] }
+    }
+
+    HTTP::release
+}
+
+
+when HTTP_RESPONSE priority 500 {
+    if { $static::debug_mcp_virtual} { log local0.info "MCP Response: [HTTP::status] for $uri" }
+
+    if { [HTTP::header exists "Content-Type"] && [HTTP::header "Content-Type"] contains "text/event-stream" } {
+        HTTP::header replace "Cache-Control" "no-cache"
+        HTTP::header insert "Connection" "keep-alive"
+    }
+
+    HTTP::header insert "Access-Control-Allow-Origin" "*"
+    HTTP::header insert "Access-Control-Allow-Methods" "GET, POST, PUT, DELETE, OPTIONS"
+    HTTP::header insert "Access-Control-Allow-Headers" "Content-Type, Authorization, X-MCP-Server"
+}
+
+when WS_CLIENT_FRAME priority 500 {
+    WS::collect frame 1000
+}
+when WS_CLIENT_DATA priority 500 {
+    set json_data [WS::payload]
+    if { [WS::frame type] == 1 } {
+        if { $static::debug_mcp_virtual } { log local0.info "MCP Client request: $json_data" }
+
+        if { [catch {
+            set request [call JSON::parse_request $json_data]
+            set method [call JSON::get_method $request]
+            set params [call JSON::get_params $request]
+            set id [call JSON::get_id $request]
+
+            if { $static::debug_mcp_virtual } { log local0.info "Request: $request; ID: $id" }
+
+            switch -- $method {
+                "tools/call" {
+                    set tool_name [call JSON::get_tool_name $params]
+                    if { $tool_name == "run_command" } {
+                        if { $static::debug_mcp_virtual } { log local0.info "VIOLATION: MCP tool $tool_name not allowed." }
+                        # TODO
+                        # RESPONSE ACTION ... still investigating
+                        # DOESN'T WORK IN THIS EVENT - WS::disconnect 1008 "VIOLATION: MCP tool $tool_name not allowed."
+                        # WS_CLIENT_FRAME_DONE fires before this
+                    }
+
+                    set response [call JSON::create_response $id $params]
+                }
+                default {
+                    set response [call JSON::create_error $id -32601 "Method not found"]
+                }
+            }
+
+            if { ![call JSON::is_notification $request] } {
+                if { $static::debug_mcp_virtual } { log local0.info [call JSON::encode_dict $response] }
+            }
+
+        } error_msg] } {
+
+            if { $static::debug_mcp_virtual } { log local0.info [call JSON::encode_dict [call JSON::create_error "" -32700 "Parse error"]] }
+        }
+
+    }
+    WS::release
+}
+when WS_SERVER_FRAME priority 500 {
+    WS::collect frame 1000
+}
+when WS_SERVER_DATA priority 500 {
+    if { [WS::frame type] == 1 } {
+        if { $static::debug_mcp_virtual } { log local0.info "MCP Server response: [WS::payload]" }
+        # TODO - Look for and remove PII data
+    }
+    WS::release
+}

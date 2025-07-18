@@ -1,0 +1,514 @@
+# JSON-RPC 2.0 Parser for iRules (Tcl 8.4.6)
+# This implementation provides basic JSON parsing and JSON-RPC 2.0 handling
+# All procedures should be called with the 'call' command in iRules
+
+#################################
+# JSON Parsing Procedures
+#################################
+
+proc parse {json_string} {
+    # Remove whitespace and normalize
+    set json_string [string trim $json_string]
+
+    # Initialize parsing state
+    set index 0
+    set length [string length $json_string]
+
+    return [call JSON::parse_value $json_string index $length]
+}
+
+proc parse_value {json_string index_var length} {
+    upvar $index_var index
+
+    # Skip whitespace
+    set index [call JSON::skip_whitespace $json_string $index $length]
+
+    if {$index >= $length} {
+        error "Unexpected end of JSON"
+    }
+
+    set char [string index $json_string $index]
+
+    switch -- $char {
+        "\"" {
+            return [call JSON::parse_string $json_string index $length]
+        }
+        "\{" {
+            return [call JSON::parse_object $json_string index $length]
+        }
+        "\[" {
+            return [call JSON::parse_array $json_string index $length]
+        }
+        "t" -
+        "f" {
+            return [call JSON::parse_boolean $json_string index $length]
+        }
+        "n" {
+            return [call JSON::parse_null $json_string index $length]
+        }
+        default {
+            if {[string match {[-0-9]} $char]} {
+                return [call JSON::parse_number $json_string index $length]
+            } else {
+                error "Invalid JSON character: $char"
+            }
+        }
+    }
+}
+
+proc parse_string {json_string index_var length} {
+    upvar $index_var index
+
+    if {[string index $json_string $index] ne "\""} {
+        error "Expected quote at start of string"
+    }
+
+    incr index
+    set start $index
+    set result ""
+
+    while {$index < $length} {
+        set char [string index $json_string $index]
+
+        if {$char eq "\""} {
+            append result [string range $json_string $start [expr {$index - 1}]]
+            incr index
+            return $result
+        } elseif {$char eq "\\"} {
+            append result [string range $json_string $start [expr {$index - 1}]]
+            incr index
+
+            if {$index >= $length} {
+                error "Unterminated string escape"
+            }
+
+            set escape_char [string index $json_string $index]
+            switch -- $escape_char {
+                "\"" { append result "\"" }
+                "\\" { append result "\\" }
+                "/" { append result "/" }
+                "b" { append result "\b" }
+                "f" { append result "\f" }
+                "n" { append result "\n" }
+                "r" { append result "\r" }
+                "t" { append result "\t" }
+                "u" {
+                    # Unicode escape - simplified handling
+                    incr index
+                    if {$index + 3 >= $length} {
+                        error "Invalid unicode escape"
+                    }
+                    set hex [string range $json_string $index [expr {$index + 3}]]
+                    append result "\\u$hex"
+                    incr index 3
+                }
+                default {
+                    error "Invalid escape sequence: \\$escape_char"
+                }
+            }
+
+            incr index
+            set start $index
+        } else {
+            incr index
+        }
+    }
+
+    error "Unterminated string"
+}
+
+proc parse_object {json_string index_var length} {
+    upvar $index_var index
+
+    if {[string index $json_string $index] ne "\{"} {
+        error "Expected \{ at start of object"
+    }
+
+    incr index
+    set result [list]
+
+    set index [call JSON::skip_whitespace $json_string $index $length]
+
+    # Handle empty object
+    if {$index < $length && [string index $json_string $index] eq "\}"} {
+        incr index
+        return $result
+    }
+
+    while {$index < $length} {
+        set index [call JSON::skip_whitespace $json_string $index $length]
+
+        # Parse key
+        set key [call JSON::parse_string $json_string index $length]
+
+        set index [call JSON::skip_whitespace $json_string $index $length]
+
+        # Expect colon
+        if {$index >= $length || [string index $json_string $index] ne ":"} {
+            error "Expected : after object key"
+        }
+        incr index
+
+        set index [call JSON::skip_whitespace $json_string $index $length]
+
+        # Parse value
+        set value [call JSON::parse_value $json_string index $length]
+
+        lappend result $key $value
+
+        set index [call JSON::skip_whitespace $json_string $index $length]
+
+        if {$index >= $length} {
+            error "Unterminated object"
+        }
+
+        set char [string index $json_string $index]
+        if {$char eq "\}"} {
+            incr index
+            break
+        } elseif {$char eq ","} {
+            incr index
+            continue
+        } else {
+            error "Expected , or \} in object"
+        }
+    }
+
+    return $result
+}
+
+proc parse_array {json_string index_var length} {
+    upvar $index_var index
+
+    if {[string index $json_string $index] ne "\["} {
+        error "Expected \[ at start of array"
+    }
+
+    incr index
+    set result [list]
+
+    set index [call JSON::skip_whitespace $json_string $index $length]
+
+    # Handle empty array
+    if {$index < $length && [string index $json_string $index] eq "\]"} {
+        incr index
+        return $result
+    }
+
+    while {$index < $length} {
+        set index [call JSON::skip_whitespace $json_string $index $length]
+
+        set value [call JSON::parse_value $json_string index $length]
+        lappend result $value
+
+        set index [call JSON::skip_whitespace $json_string $index $length]
+
+        if {$index >= $length} {
+            error "Unterminated array"
+        }
+
+        set char [string index $json_string $index]
+        if {$char eq "\]"} {
+            incr index
+            break
+        } elseif {$char eq ","} {
+            incr index
+            continue
+        } else {
+            error "Expected , or \] in array"
+        }
+    }
+
+    return $result
+}
+
+proc parse_number {json_string index_var length} {
+    upvar $index_var index
+
+    set start $index
+    set char [string index $json_string $index]
+
+    # Handle negative sign
+    if {$char eq "-"} {
+        incr index
+    }
+
+    # Parse integer part
+    while {$index < $length && [string is digit [string index $json_string $index]]} {
+        incr index
+    }
+
+    # Parse decimal part
+    if {$index < $length && [string index $json_string $index] eq "."} {
+        incr index
+        while {$index < $length && [string is digit [string index $json_string $index]]} {
+            incr index
+        }
+    }
+
+    # Parse exponent part
+    if {$index < $length && [string tolower [string index $json_string $index]] eq "e"} {
+        incr index
+        if {$index < $length && [string match {[+-]} [string index $json_string $index]]} {
+            incr index
+        }
+        while {$index < $length && [string is digit [string index $json_string $index]]} {
+            incr index
+        }
+    }
+
+    set number [string range $json_string $start [expr {$index - 1}]]
+
+    # Convert to number
+    if {[string first "." $number] != -1 || [string first "e" [string tolower $number]] != -1} {
+        return [expr {double($number)}]
+    } else {
+        return [expr {int($number)}]
+    }
+}
+
+proc parse_boolean {json_string index_var length} {
+    upvar $index_var index
+
+    if {[string range $json_string $index [expr {$index + 3}]] eq "true"} {
+        incr index 4
+        return 1
+    } elseif {[string range $json_string $index [expr {$index + 4}]] eq "false"} {
+        incr index 5
+        return 0
+    } else {
+        error "Invalid boolean value"
+    }
+}
+
+proc parse_null {json_string index_var length} {
+    upvar $index_var index
+
+    if {[string range $json_string $index [expr {$index + 3}]] eq "null"} {
+        incr index 4
+        return ""
+    } else {
+        error "Invalid null value"
+    }
+}
+
+proc skip_whitespace {json_string index length} {
+    while {$index < $length} {
+        set char [string index $json_string $index]
+        if {$char eq " " || $char eq "\t" || $char eq "\n" || $char eq "\r"} {
+            incr index
+        } else {
+            break
+        }
+    }
+    return $index
+}
+
+#################################
+# JSON-RPC 2.0 Specific Procedures
+#################################
+
+proc parse_request {json_string} {
+    set parsed [call JSON::parse $json_string]
+
+    # Extract JSON-RPC components
+    set request [list]
+
+    # Check for required fields
+    set jsonrpc [call JSON::get_value $parsed "jsonrpc"]
+    if {$jsonrpc ne "2.0"} {
+        error "Invalid JSON-RPC version: $jsonrpc"
+    }
+
+    set method [call JSON::get_value $parsed "method"]
+    if {$method eq ""} {
+        error "Missing required field: method"
+    }
+
+    lappend request "jsonrpc" $jsonrpc
+    lappend request "method" $method
+
+    # Optional fields
+    set params [call JSON::get_value $parsed "params"]
+    if {$params ne ""} {
+        lappend request "params" $params
+    }
+
+    set id [call JSON::get_value $parsed "id"]
+    if {$id ne ""} {
+        lappend request "id" $id
+    }
+
+    return $request
+}
+
+proc create_response {id result} {
+    set response [list]
+    lappend response "jsonrpc" "2.0"
+    lappend response "result" $result
+    lappend response "id" $id
+    return $response
+}
+
+proc create_error {id code message {data ""}} {
+    set error [list]
+    lappend error "code" $code
+    lappend error "message" $message
+    if {$data ne ""} {
+        lappend error "data" $data
+    }
+
+    set response [list]
+    lappend response "jsonrpc" "2.0"
+    lappend response "error" $error
+    lappend response "id" $id
+    return $response
+}
+
+proc is_notification {request} {
+    return [expr {[call JSON::get_value $request "id"] eq ""}]
+}
+
+proc get_method {request} {
+    return [call JSON::get_value $request "method"]
+}
+
+proc get_params {request} {
+    return [call JSON::get_value $request "params"]
+}
+
+proc get_id {request} {
+    return [call JSON::get_value $request "id"]
+}
+
+proc get_tool_name {params} {
+    return [call JSON::get_value $params "name"]
+}
+
+#################################
+# Helper Procedures
+#################################
+
+proc get_value {dict key} {
+    set index [lsearch -exact $dict $key]
+    if {$index != -1 && $index < [llength $dict] - 1} {
+        return [lindex $dict [expr {$index + 1}]]
+    }
+    return ""
+}
+
+proc encode_string {str} {
+    set result "\""
+    set length [string length $str]
+
+    for {set i 0} {$i < $length} {incr i} {
+        set char [string index $str $i]
+        switch -- $char {
+            "\"" { append result "\\\"" }
+            "\\" { append result "\\\\" }
+            "/" { append result "\\/" }
+            "\b" { append result "\\b" }
+            "\f" { append result "\\f" }
+            "\n" { append result "\\n" }
+            "\r" { append result "\\r" }
+            "\t" { append result "\\t" }
+            default {
+                append result $char
+            }
+        }
+    }
+
+    append result "\""
+    return $result
+}
+
+proc encode_dict {dict} {
+    if { [llength $dict] == 0 } {
+        return "\{\}"
+    }
+
+    set result "\{"
+    set first 1
+
+    foreach {key value} $dict {
+        if {!$first} {
+            append result ","
+        }
+        set first 0
+
+        append result [call JSON::encode_string $key]
+        append result ":"
+        append result [call JSON::encode_value $value]
+    }
+
+    append result "\}"
+    return $result
+}
+
+proc encode_value {value} {
+    # Handle empty values as empty object
+    if {$value eq "" || [llength $value] == 0} {
+        return "\{\}"
+    }
+
+    # Check if it's a number
+    if {[string is integer -strict $value]} {
+        return $value
+    } elseif {[string is double -strict $value]} {
+        return $value
+    }
+
+    # Check for boolean values
+    if {$value eq "true" || $value eq "false"} {
+        return $value
+    }
+
+    # Check if it's null
+    if {$value eq "null"} {
+        return "null"
+    }
+
+    # Try to detect if it's a dict/list (even number of elements)
+    if {[llength $value] % 2 == 0 && [llength $value] > 0} {
+        # In Tcl 8.4.6, we assume even-length lists are dict-like structures
+        # Try to validate by checking if all odd positions are valid strings
+        set is_dict 1
+        for {set i 0} {$i < [llength $value]} {incr i 2} {
+            set key [lindex $value $i]
+            # Basic check - if the key position is empty, it's not a dict
+            if {$key eq ""} {
+                set is_dict 0
+                break
+            }
+        }
+
+        if {$is_dict} {
+            return [call JSON::encode_dict $value]
+        }
+    }
+
+    # Check if it's an array (list)
+    if {[llength $value] > 1 || ([llength $value] == 1 && [string first " " $value] != -1)} {
+        # It's likely an array
+        return [call JSON::encode_array $value]
+    }
+
+    # Default to string
+    return [call JSON::encode_string $value]
+}
+
+proc encode_array {list} {
+    set result "\["
+    set first 1
+
+    foreach item $list {
+        if {!$first} {
+            append result ","
+        }
+        set first 0
+        append result [call JSON::encode_value $item]
+    }
+
+    append result "\]"
+    return $result
+}
